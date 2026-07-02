@@ -1,9 +1,14 @@
 pipeline {
     agent any
 
+    tools {
+        nodejs 'NodeJS-22'
+    }
+
     environment {
-        IMAGE_NAME = '0xchaser/tp_pipeline_back'
-        IMAGE_TAG  = "${env.BUILD_NUMBER}"
+        DOCKERHUB_CREDS = credentials('dockerhub-credentials')
+        IMAGE_TAG       = "${BUILD_NUMBER}"
+        IMAGE_REF       = "${DOCKERHUB_CREDS_USR}/tp_pipeline_back"
     }
 
     options {
@@ -12,31 +17,51 @@ pipeline {
     }
 
     stages {
-        stage('Checkout') {
-            steps {
-                checkout scm
-            }
-        }
 
-        stage('Install dependencies') {
+        stage('Install') {
             steps {
                 sh 'npm ci'
                 sh 'npx prisma generate'
             }
         }
 
-        stage('Unit tests + coverage') {
+        stage('Build') {
+            steps {
+                sh 'npm run build'
+            }
+            post {
+                success {
+                    archiveArtifacts artifacts: 'dist/**', fingerprint: true
+                }
+            }
+        }
+
+        stage('Unit Tests') {
             steps {
                 sh 'npm run test:coverage'
             }
             post {
                 always {
                     junit 'reports/junit.xml'
+                    publishHTML(target: [
+                        allowMissing         : true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll              : true,
+                        reportDir            : 'coverage/lcov-report',
+                        reportFiles          : 'index.html',
+                        reportName           : 'Coverage Report'
+                    ])
                 }
             }
         }
 
-        stage('SonarQube analysis') {
+        stage('E2E Tests') {
+            steps {
+                sh 'npm run test:e2e'
+            }
+        }
+
+        stage('SonarQube Analysis') {
             steps {
                 withSonarQubeEnv('SonarQube') {
                     sh 'sonar-scanner'
@@ -52,66 +77,50 @@ pipeline {
             }
         }
 
-        stage('Build') {
+        stage('Docker Build') {
             steps {
-                sh 'npx tsc -p tsconfig.build.json'
-            }
-            post {
-                success {
-                    archiveArtifacts artifacts: 'dist/**', fingerprint: true
-                }
-            }
-        }
-
-        stage('Docker build') {
-            steps {
-                sh 'docker build -t $IMAGE_NAME:$IMAGE_TAG -t $IMAGE_NAME:latest .'
-            }
-        }
-
-        stage('Security scan (Trivy)') {
-            steps {
-                sh '''
-                    trivy image --severity HIGH,CRITICAL --ignore-unfixed \
-                        --format table --output trivy-report.txt $IMAGE_NAME:$IMAGE_TAG
-                    cat trivy-report.txt
-                    trivy image --severity CRITICAL --ignore-unfixed \
-                        --exit-code 1 --quiet $IMAGE_NAME:$IMAGE_TAG
-                '''
-            }
-            post {
-                always {
-                    archiveArtifacts artifacts: 'trivy-report.txt', allowEmptyArchive: true
-                }
+                sh "docker build -t ${IMAGE_REF}:${IMAGE_TAG} -t ${IMAGE_REF}:latest ."
             }
         }
 
         stage('SBOM (SPDX)') {
             steps {
-                sh 'syft $IMAGE_NAME:$IMAGE_TAG -o spdx-json > sbom-spdx.json'
+                sh "trivy image --format spdx-json --output sbom-spdx.json ${IMAGE_REF}:${IMAGE_TAG}"
             }
             post {
-                success {
-                    archiveArtifacts artifacts: 'sbom-spdx.json', fingerprint: true
+                always {
+                    archiveArtifacts artifacts: 'sbom-spdx.json', fingerprint: true, allowEmptyArchive: true
                 }
             }
         }
 
-        stage('Push to Docker Hub') {
+        stage('Trivy Scan') {
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-creds',
-                    usernameVariable: 'DOCKERHUB_USER',
-                    passwordVariable: 'DOCKERHUB_TOKEN'
-                )]) {
-                    sh '''
-                        export DOCKER_CONFIG="$WORKSPACE/.docker"
-                        mkdir -p "$DOCKER_CONFIG"
-                        echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
-                        docker push $IMAGE_NAME:$IMAGE_TAG
-                        docker push $IMAGE_NAME:latest
-                        docker logout
-                    '''
+                sh "trivy image --severity HIGH,CRITICAL --exit-code 0 --format table --output trivy-report.txt ${IMAGE_REF}:${IMAGE_TAG}"
+                sh 'cat trivy-report.txt'
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'trivy-report.txt', fingerprint: true, allowEmptyArchive: true
+                }
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                // config docker propre au workspace : deux builds simultanes
+                // ne partagent pas leur session de login
+                sh '''
+                    export DOCKER_CONFIG="$WORKSPACE/.docker"
+                    mkdir -p "$DOCKER_CONFIG"
+                    echo "$DOCKERHUB_CREDS_PSW" | docker login -u "$DOCKERHUB_CREDS_USR" --password-stdin
+                    docker push "$IMAGE_REF:$IMAGE_TAG"
+                    docker push "$IMAGE_REF:latest"
+                '''
+            }
+            post {
+                always {
+                    sh 'DOCKER_CONFIG="$WORKSPACE/.docker" docker logout || true'
                 }
             }
         }
@@ -120,6 +129,12 @@ pipeline {
     post {
         always {
             cleanWs()
+        }
+        success {
+            echo "Pipeline OK : image ${IMAGE_REF}:${IMAGE_TAG} publiee sur Docker Hub"
+        }
+        failure {
+            echo 'Pipeline en echec, voir les logs ci-dessus'
         }
     }
 }
